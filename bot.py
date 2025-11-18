@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-بوت تلقرام للاختبارات - أساسيات شبكات الحاسب
-يقدم اختبارات تفاعلية مع نظام تتبع النقاط
+بوت اختبارات أساسيات شبكات الحاسب
+يحتوي على نظام كامل للاختبارات مع إحصائيات مفصلة
+مع ميزة الانتقال التلقائي للسؤال التالي
+مع Keep-Alive للعمل 24/7 على Render
 """
-import os
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 import json
-import random
 import logging
+import random
+import os
+import asyncio
 from typing import Dict, List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -17,303 +20,419 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
-    ConversationHandler
 )
 
-# إعداد نظام السجلات
+# استيراد Flask للـ Keep-Alive
+from flask import Flask
+from threading import Thread
+
+# إعداد السجلات
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# حالات المحادثة
-ANSWERING = 1
+# إعداد Flask للـ Keep-Alive
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    """صفحة رئيسية بسيطة للتحقق من عمل البوت"""
+    return """
+    <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Telegram Quiz Bot</title>
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    text-align: center;
+                    padding: 50px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                }
+                .container {
+                    background: rgba(255,255,255,0.1);
+                    padding: 30px;
+                    border-radius: 15px;
+                    backdrop-filter: blur(10px);
+                }
+                h1 { font-size: 2.5em; margin-bottom: 20px; }
+                p { font-size: 1.2em; }
+                .status { color: #4ade80; font-weight: bold; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🤖 بوت اختبارات شبكات الحاسب</h1>
+                <p class="status">✅ البوت يعمل بنجاح!</p>
+                <p>📊 عدد الأسئلة: 34 سؤال</p>
+                <p>🔗 ابحث عن البوت في Telegram: <strong>@cs_networks_bot</strong></p>
+                <hr style="margin: 30px 0; border: 1px solid rgba(255,255,255,0.3);">
+                <p style="font-size: 0.9em;">Bot is running on Render 🚀</p>
+            </div>
+        </body>
+    </html>
+    """
+
+@app.route('/health')
+def health():
+    """نقطة فحص صحة البوت"""
+    return {"status": "ok", "bot": "running"}, 200
+
+def run_flask():
+    """تشغيل Flask في thread منفصل"""
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
 
 # تحميل الأسئلة من ملف JSON
-def load_questions() -> List[Dict]:
+def load_questions():
     """تحميل الأسئلة من ملف JSON"""
     try:
         with open('questions.json', 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return data['questions']
+            return json.load(f)
     except FileNotFoundError:
         logger.error("ملف questions.json غير موجود!")
         return []
     except json.JSONDecodeError:
-        logger.error("خطأ في قراءة ملف JSON!")
+        logger.error("خطأ في قراءة ملف questions.json!")
         return []
 
-# تحميل الأسئلة عند بدء البوت
+# تحميل الأسئلة
 QUESTIONS = load_questions()
+TOTAL_QUESTIONS = len(QUESTIONS)
 
 # تخزين بيانات المستخدمين
-user_data_store: Dict[int, Dict] = {}
+user_data: Dict[int, Dict] = {}
 
 def get_user_data(user_id: int) -> Dict:
-    """الحصول على بيانات المستخدم أو إنشاء بيانات جديدة"""
-    if user_id not in user_data_store:
-        user_data_store[user_id] = {
+    """الحصول على بيانات المستخدم أو إنشاؤها"""
+    if user_id not in user_data:
+        user_data[user_id] = {
             'score': 0,
-            'total_questions': 0,
-            'current_question': None,
-            'answered_questions': []
+            'total_answered': 0,
+            'correct_answers': 0,
+            'wrong_answers': 0,
+            'asked_questions': [],
+            'current_question': None
         }
-    return user_data_store[user_id]
+    return user_data[user_id]
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def get_final_results_text(user_id: int) -> str:
+    """الحصول على نص النتيجة النهائية"""
+    data = get_user_data(user_id)
+    
+    percentage = (data['score'] / data['total_answered'] * 100) if data['total_answered'] > 0 else 0
+    
+    # تحديد التقييم
+    if percentage >= 90:
+        rating = "ممتاز 🌟"
+    elif percentage >= 80:
+        rating = "جيد جداً 👍"
+    elif percentage >= 70:
+        rating = "جيد ✓"
+    elif percentage >= 60:
+        rating = "مقبول"
+    else:
+        rating = "يحتاج تحسين"
+    
+    results = f"""📊 **الإحصائيات الكاملة:**
+
+✅ إجابات صحيحة: {data['correct_answers']}
+❌ إجابات خاطئة: {data['wrong_answers']}
+📝 إجمالي الأسئلة: {data['total_answered']} من {TOTAL_QUESTIONS}
+
+🎯 النسبة المئوية: {percentage:.1f}%
+⭐ التقييم: {rating}
+"""
+    return results
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالج أمر /start"""
-    user = update.effective_user
-    user_id = user.id
+    user_id = update.effective_user.id
+    user_name = update.effective_user.first_name
     
     # إعادة تعيين بيانات المستخدم
-    user_data_store[user_id] = {
-        'score': 0,
-        'total_questions': 0,
-        'current_question': None,
-        'answered_questions': []
-    }
+    if user_id in user_data:
+        user_data[user_id] = {
+            'score': 0,
+            'total_answered': 0,
+            'correct_answers': 0,
+            'wrong_answers': 0,
+            'asked_questions': [],
+            'current_question': None
+        }
     
-    welcome_message = f"""
-👋 مرحباً {user.first_name}!
+    welcome_text = f"""👋 مرحباً {user_name}!
 
 🎓 **بوت اختبارات أساسيات شبكات الحاسب**
 
-هذا البوت يساعدك على اختبار معلوماتك في مجال شبكات الحاسب من خلال أسئلة اختيار من متعدد.
+📊 **عدد الأسئلة:** {TOTAL_QUESTIONS} سؤال
 
 📚 **الأوامر المتاحة:**
-/start - بدء جديد وإعادة تعيين النقاط
 /quiz - بدء الاختبار
-/score - عرض نتيجتك الحالية
+/score - عرض نتيجتك
 /stats - عرض إحصائيات مفصلة
+/reset - البدء من جديد
 /help - عرض المساعدة
 
 ✨ اضغط على /quiz لبدء الاختبار!
 """
     
-    await update.message.reply_text(welcome_message)
+    await update.message.reply_text(welcome_text)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالج أمر /help"""
-    help_text = """
-📖 **كيفية استخدام البوت:**
+    help_text = """📖 **كيفية استخدام البوت:**
 
 1️⃣ اضغط على /quiz لبدء الاختبار
 2️⃣ سيتم عرض سؤال مع خيارات متعددة
 3️⃣ اختر الإجابة الصحيحة من الأزرار
-4️⃣ سيتم إخبارك فوراً إذا كانت إجابتك صحيحة أم خاطئة
-5️⃣ يمكنك متابعة الإجابة على المزيد من الأسئلة
-6️⃣ استخدم /score لمعرفة نتيجتك في أي وقت
+4️⃣ سيتم إخبارك فوراً إذا كانت إجابتك صحيحة أو خاطئة
+5️⃣ **سيظهر السؤال التالي تلقائياً** بعد 3 ثوانٍ
+6️⃣ بعد الإجابة على جميع الأسئلة، ستظهر النتيجة النهائية تلقائياً
 
-💡 **نصائح:**
-• كل سؤال له 4 خيارات، واحد منها فقط صحيح
-• يتم اختيار الأسئلة بشكل عشوائي
-• يمكنك إعادة البدء في أي وقت باستخدام /start
+**ملاحظات:**
+• كل سؤال يظهر مرة واحدة فقط
+• بعد الانتهاء من جميع الأسئلة، يمكنك البدء من جديد
+• استخدم /reset لإعادة تعيين النتائج والبدء من جديد
 
-حظاً موفقاً! 🍀
-"""
+حظاً موفقاً! 🍀"""
+    
     await update.message.reply_text(help_text)
 
-async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """بدء سؤال جديد"""
-    user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
+async def send_next_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """إرسال السؤال التالي"""
+    data = get_user_data(user_id)
     
+    # التحقق من وجود أسئلة
     if not QUESTIONS:
-        await update.message.reply_text("⚠️ عذراً، لا توجد أسئلة متاحة حالياً.")
-        return ConversationHandler.END
-    
-    # اختيار سؤال عشوائي
-    question = random.choice(QUESTIONS)
-    user_data['current_question'] = question
-    
-    # إنشاء أزرار الخيارات
-    keyboard = []
-    for i, option in enumerate(question['options']):
-        keyboard.append([InlineKeyboardButton(
-            f"{chr(65 + i)}) {option}",
-            callback_data=f"answer_{i}"
-        )])
-    
-    # إضافة زر الإلغاء
-    keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    question_text = f"""
-❓ **السؤال رقم {user_data['total_questions'] + 1}:**
-
-{question['question']}
-
-اختر الإجابة الصحيحة:
-"""
-    
-    await update.message.reply_text(question_text, reply_markup=reply_markup)
-    return ANSWERING
-
-async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """معالجة إجابة المستخدم"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
-    
-    if query.data == "cancel":
-        await query.edit_message_text("❌ تم إلغاء السؤال.")
-        return ConversationHandler.END
-    
-    # استخراج رقم الإجابة
-    answer_index = int(query.data.split('_')[1])
-    current_question = user_data['current_question']
-    
-    if not current_question:
-        await query.edit_message_text("⚠️ حدث خطأ، الرجاء المحاولة مرة أخرى.")
-        return ConversationHandler.END
-    
-    # تحديث الإحصائيات
-    user_data['total_questions'] += 1
-    user_data['answered_questions'].append(current_question['id'])
-    
-    # التحقق من الإجابة
-    is_correct = answer_index == current_question['correct_answer']
-    
-    if is_correct:
-        user_data['score'] += 1
-        result_emoji = "✅"
-        result_text = "**إجابة صحيحة!** 🎉"
-    else:
-        result_emoji = "❌"
-        correct_option = current_question['options'][current_question['correct_answer']]
-        result_text = f"**إجابة خاطئة!**\n\n✅ الإجابة الصحيحة: {correct_option}"
-    
-    # عرض النتيجة مع الشرح
-    response = f"""
-{result_emoji} {result_text}
-
-💡 **الشرح:**
-{current_question['explanation']}
-
-📊 **نتيجتك الحالية:**
-{user_data['score']} / {user_data['total_questions']} ({int(user_data['score'] / user_data['total_questions'] * 100)}%)
-
-استخدم /quiz للسؤال التالي
-استخدم /score لعرض الإحصائيات
-"""
-    
-    await query.edit_message_text(response)
-    return ConversationHandler.END
-
-async def score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """عرض النتيجة الحالية"""
-    user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
-    
-    if user_data['total_questions'] == 0:
-        await update.message.reply_text(
-            "📊 لم تجب على أي سؤال بعد!\n\n"
-            "استخدم /quiz لبدء الاختبار."
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ عذراً، لا توجد أسئلة متاحة حالياً."
         )
         return
     
-    percentage = int(user_data['score'] / user_data['total_questions'] * 100)
+    # التحقق من إنهاء جميع الأسئلة
+    if len(data['asked_questions']) >= TOTAL_QUESTIONS:
+        results_text = "🎊 **النتيجة النهائية**\n\n"
+        results_text += get_final_results_text(user_id)
+        results_text += "\n\nاستخدم /reset للبدء من جديد"
+        await context.bot.send_message(chat_id=chat_id, text=results_text)
+        return
     
-    # تحديد التقييم بناءً على النسبة
-    if percentage >= 90:
-        grade = "ممتاز 🌟"
-    elif percentage >= 80:
-        grade = "جيد جداً 👍"
-    elif percentage >= 70:
-        grade = "جيد ✨"
-    elif percentage >= 60:
-        grade = "مقبول 📚"
+    # اختيار سؤال عشوائي لم يتم طرحه
+    available_questions = [
+        i for i in range(TOTAL_QUESTIONS)
+        if i not in data['asked_questions']
+    ]
+    
+    if not available_questions:
+        results_text = "🎊 **النتيجة النهائية**\n\n"
+        results_text += get_final_results_text(user_id)
+        results_text += "\n\nاستخدم /reset للبدء من جديد"
+        await context.bot.send_message(chat_id=chat_id, text=results_text)
+        return
+    
+    question_index = random.choice(available_questions)
+    question_data = QUESTIONS[question_index]
+    
+    # حفظ السؤال الحالي
+    data['current_question'] = question_index
+    
+    # إنشاء أزرار الخيارات
+    keyboard = []
+    for i, option in enumerate(question_data['options']):
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{chr(65+i)}. {option}",
+                callback_data=f"answer_{question_index}_{i}"
+            )
+        ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # عرض السؤال مع المعلومات
+    remaining = TOTAL_QUESTIONS - len(data['asked_questions'])
+    question_text = f"""❓ **السؤال {len(data['asked_questions']) + 1} من {TOTAL_QUESTIONS}**
+
+{question_data['question']}
+
+📊 **الأسئلة المتبقية:** {remaining - 1}
+"""
+    
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=question_text,
+        reply_markup=reply_markup
+    )
+
+async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج أمر /quiz - عرض سؤال جديد"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    await send_next_question(chat_id, context, user_id)
+
+async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج الإجابات"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    data = get_user_data(user_id)
+    
+    # تحليل البيانات
+    try:
+        _, question_index, selected_option = query.data.split('_')
+        question_index = int(question_index)
+        selected_option = int(selected_option)
+    except (ValueError, IndexError):
+        await query.edit_message_text("❌ خطأ في معالجة الإجابة.")
+        return
+    
+    # التحقق من السؤال
+    if question_index >= len(QUESTIONS):
+        await query.edit_message_text("❌ سؤال غير صالح.")
+        return
+    
+    question_data = QUESTIONS[question_index]
+    correct_answer = question_data['correct']
+    
+    # تحديث الإحصائيات
+    data['asked_questions'].append(question_index)
+    data['total_answered'] += 1
+    
+    # التحقق من الإجابة
+    is_correct = (selected_option == correct_answer)
+    
+    if is_correct:
+        data['score'] += 1
+        data['correct_answers'] += 1
+        result_emoji = "✅"
+        result_text = "**إجابة صحيحة!** 🎉"
     else:
-        grade = "يحتاج تحسين 💪"
+        data['wrong_answers'] += 1
+        result_emoji = "❌"
+        result_text = "**إجابة خاطئة!**"
+        correct_option_text = question_data['options'][correct_answer]
+        result_text += f"\n\n✅ الإجابة الصحيحة: {correct_option_text}"
     
-    score_text = f"""
+    # حساب النسبة المئوية
+    percentage = (data['score'] / data['total_answered']) * 100
+    
+    response = f"""{result_emoji} {result_text}
+
+💡 **الشرح:**
+{question_data['explanation']}
+
 📊 **نتيجتك الحالية:**
+{data['score']} / {data['total_answered']} ({percentage:.0f}%)
 
-✅ الإجابات الصحيحة: {user_data['score']}
-❌ الإجابات الخاطئة: {user_data['total_questions'] - user_data['score']}
-📝 إجمالي الأسئلة: {user_data['total_questions']}
-📈 النسبة المئوية: {percentage}%
+"""
+    
+    # التحقق من إنهاء جميع الأسئلة
+    if len(data['asked_questions']) >= TOTAL_QUESTIONS:
+        response += "\n🎊 **تهانينا! أكملت جميع الأسئلة!**\n\n"
+        response += get_final_results_text(user_id)
+        response += "\n\nاستخدم /reset للبدء من جديد"
+        await query.edit_message_text(response)
+    else:
+        response += "⏳ السؤال التالي سيظهر خلال 3 ثوانٍ..."
+        await query.edit_message_text(response)
+        
+        # إرسال السؤال التالي بعد 3 ثوانٍ
+        await asyncio.sleep(3)
+        await send_next_question(chat_id, context, user_id)
 
-🏆 التقييم: {grade}
+async def score(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج أمر /score - عرض النتيجة الحالية"""
+    user_id = update.effective_user.id
+    data = get_user_data(user_id)
+    
+    if data['total_answered'] == 0:
+        await update.message.reply_text("📊 لم تجب على أي سؤال بعد!\n\nاستخدم /quiz لبدء الاختبار.")
+        return
+    
+    percentage = (data['score'] / data['total_answered']) * 100
+    
+    score_text = f"""📊 **نتيجتك الحالية:**
 
-استخدم /quiz لمواصلة الاختبار
-استخدم /start لإعادة البدء من الصفر
+✅ إجابات صحيحة: {data['correct_answers']}
+❌ إجابات خاطئة: {data['wrong_answers']}
+📝 إجمالي الأسئلة: {data['total_answered']} من {TOTAL_QUESTIONS}
+
+🎯 النسبة المئوية: {percentage:.1f}%
+
+📈 الأسئلة المتبقية: {TOTAL_QUESTIONS - len(data['asked_questions'])}
 """
     
     await update.message.reply_text(score_text)
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """عرض إحصائيات مفصلة"""
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج أمر /stats - عرض إحصائيات مفصلة"""
     user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
+    data = get_user_data(user_id)
     
-    if user_data['total_questions'] == 0:
-        await update.message.reply_text(
-            "📊 لا توجد إحصائيات بعد!\n\n"
-            "استخدم /quiz لبدء الاختبار."
-        )
+    if data['total_answered'] == 0:
+        await update.message.reply_text("📊 لا توجد إحصائيات بعد!\n\nاستخدم /quiz لبدء الاختبار.")
         return
     
-    percentage = int(user_data['score'] / user_data['total_questions'] * 100)
-    wrong_answers = user_data['total_questions'] - user_data['score']
-    
-    stats_text = f"""
-📈 **إحصائيات مفصلة:**
-
-👤 **المستخدم:** {update.effective_user.first_name}
-
-📊 **الأداء العام:**
-• الإجابات الصحيحة: {user_data['score']} ✅
-• الإجابات الخاطئة: {wrong_answers} ❌
-• إجمالي الأسئلة: {user_data['total_questions']} 📝
-• نسبة النجاح: {percentage}% 📈
-
-📚 **معلومات إضافية:**
-• عدد الأسئلة المتاحة: {len(QUESTIONS)}
-• الأسئلة المجاب عليها: {len(user_data['answered_questions'])}
-
-💡 استمر في التدريب لتحسين نتيجتك!
-"""
+    stats_text = get_final_results_text(user_id)
+    stats_text += f"\n📈 **التقدم:** {len(data['asked_questions'])} / {TOTAL_QUESTIONS} ({len(data['asked_questions'])/TOTAL_QUESTIONS*100:.1f}%)"
     
     await update.message.reply_text(stats_text)
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """إلغاء المحادثة"""
-    await update.message.reply_text("تم الإلغاء. استخدم /quiz لبدء اختبار جديد.")
-    return ConversationHandler.END
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج أمر /reset - إعادة تعيين النتائج"""
+    user_id = update.effective_user.id
+    
+    # إعادة تعيين البيانات
+    user_data[user_id] = {
+        'score': 0,
+        'total_answered': 0,
+        'correct_answers': 0,
+        'wrong_answers': 0,
+        'asked_questions': [],
+        'current_question': None
+    }
+    
+    await update.message.reply_text(
+        "🔄 تم إعادة تعيين النتائج بنجاح!\n\n"
+        "استخدم /quiz لبدء الاختبار من جديد."
+    )
 
-def main() -> None:
+def main():
     """تشغيل البوت"""
-    # ضع توكن البوت الخاص بك هنا
-    "TOKEN = "1234567890:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
-
+    # التوكن من متغيرات البيئة
+    TOKEN = os.environ.get("TELEGRAM_TOKEN")
+    
+    if not TOKEN:
+        logger.error("⚠️ يرجى تعيين متغير البيئة TELEGRAM_TOKEN!")
+        return
+    
+    # تشغيل Flask في thread منفصل للـ Keep-Alive
+    logger.info("🌐 تشغيل Flask server للـ Keep-Alive...")
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
     
     # إنشاء التطبيق
     application = Application.builder().token(TOKEN).build()
     
-    # معالجات الأوامر
+    # إضافة المعالجات
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("quiz", quiz))
     application.add_handler(CommandHandler("score", score))
     application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("reset", reset))
+    application.add_handler(CallbackQueryHandler(handle_answer, pattern="^answer_"))
     
-    # معالج المحادثة للاختبار
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("quiz", quiz)],
-        states={
-            ANSWERING: [CallbackQueryHandler(answer)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    
-    application.add_handler(conv_handler)
-    
-    # بدء البوت
-    logger.info("🤖 البوت يعمل الآن...")
+    # تشغيل البوت
+    logger.info(f"🤖 البوت يعمل الآن على Render... (عدد الأسئلة: {TOTAL_QUESTIONS})")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
